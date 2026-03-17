@@ -1,0 +1,22 @@
+services:
+  wall_seg:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: wall_segmentation
+    network_mode: host
+    ipc: host
+    privileged: true
+    runtime: nvidia
+    working_dir: /app
+    volumes:
+      - /home/${USER}/WallSegmentation:/app
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    environment:
+      - ROS_DOMAIN_ID=0
+      - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - WALL_SEG_TEST=${WALL_SEG_TEST:-0}
+      - DISPLAY
+    command: ["sh", "-c", "if [ \"$$WALL_SEG_TEST\" = \"1\" ] || [ \"$$WALL_SEG_TEST\" = \"true\" ]; then python3 run_realsense_live.py; else python3 run_realsense_ros2.py; fi"]
