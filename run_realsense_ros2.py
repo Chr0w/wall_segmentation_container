@@ -71,11 +71,23 @@ class WallSegmentationNode(Node):
         t.child_frame_id = FRAME_ID
         t.transform.translation.x = 0.0
         t.transform.translation.y = 0.0
-        t.transform.translation.z = -3.0
-        t.transform.rotation.x = 0.5
-        t.transform.rotation.y = 0.5
-        t.transform.rotation.z = 0.5
-        t.transform.rotation.w = 0.5
+        t.transform.translation.z = 3.0
+
+        # RPY (deg) -> quaternion for TF (ROS order: Rz(yaw)*Ry(pitch)*Rx(roll))
+        # Rotation is around parent frame (base_link)
+        roll = -90.0
+        pitch = 0.0
+        yaw = -90.0
+        roll_rad = math.radians(roll)
+        pitch_rad = math.radians(pitch)
+        yaw_rad = math.radians(yaw)
+        cr, sr = math.cos(roll_rad / 2), math.sin(roll_rad / 2)
+        cp, sp = math.cos(pitch_rad / 2), math.sin(pitch_rad / 2)
+        cy, sy = math.cos(yaw_rad / 2), math.sin(yaw_rad / 2)
+        t.transform.rotation.x = sr * cp * cy - cr * sp * sy
+        t.transform.rotation.y = cr * sp * cy + sr * cp * sy
+        t.transform.rotation.z = cr * cp * sy - sr * sp * cy
+        t.transform.rotation.w = cr * cp * cy + sr * sp * sy
         self._tf_static.sendTransform(t)
         self.get_logger().info("Published static TF %s -> %s" % (parent_frame, FRAME_ID))
 
