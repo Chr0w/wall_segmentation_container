@@ -10,7 +10,7 @@ services:
     runtime: nvidia
     working_dir: /app
     volumes:
-      - /home/${USER}/WallSegmentation:/app
+      - .:/app
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
     environment:
       - ROS_DOMAIN_ID=0
