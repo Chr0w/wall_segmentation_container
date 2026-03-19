@@ -10,12 +10,14 @@ import argparse
 import math
 import threading
 import time
+import queue
 import numpy as np
 import cv2
 from PIL import Image
 
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import SingleThreadedExecutor
 from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import Image as ImageMsg, CameraInfo
 from geometry_msgs.msg import TransformStamped
@@ -44,7 +46,10 @@ DOWNSCALE_PERCENTAGE = 1.0
 PUBLISH_MAX_HZ = 10.0
 
 # Test variable to set all walls to true
-ALL_TRUE = True
+ALL_TRUE = False
+
+# Source detection timeout
+SOURCE_DETECTION_TIMEOUT_SEC = 10.0
 
 class WallSegmentationNode(Node):
     def __init__(self, args):
@@ -97,25 +102,45 @@ class WallSegmentationNode(Node):
         self.segmentation_module = SegmentationModule(net_encoder, net_decoder)
         self.segmentation_module = self.segmentation_module.to(DEVICE).eval()
 
-        config = rs.config()
-        config.enable_stream(rs.stream.color, RS_WIDTH, RS_HEIGHT, rs.format.bgr8, RS_FPS)
-        self.pipeline = rs.pipeline()
-        self.get_logger().info("Starting RealSense pipeline (color stream)...")
-        self.pipeline.start(config)
-
-        # Cache color stream intrinsics for CameraInfo (scaled when publishing downscaled images)
-        profile = self.pipeline.get_active_profile()
-        color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
-        self._color_intrinsics = color_profile.get_intrinsics()
-        self.get_logger().info(
-            "RealSense color intrinsics: fx=%.1f fy=%.1f cx=%.1f cy=%.1f"
-            % (
-                self._color_intrinsics.fx,
-                self._color_intrinsics.fy,
-                self._color_intrinsics.ppx,
-                self._color_intrinsics.ppy,
+        # Detect source (simulator or RealSense camera)
+        self.source_type = None  # "simulator" or "realsense"
+        self.pipeline = None
+        self._color_intrinsics = None
+        self._sim_frame_queue = queue.Queue(maxsize=10)
+        self._sim_sub = None
+        
+        # Always initialize RealSense pipeline to get camera_info intrinsics
+        # (needed for both sources)
+        try:
+            config = rs.config()
+            config.enable_stream(rs.stream.color, RS_WIDTH, RS_HEIGHT, rs.format.bgr8, RS_FPS)
+            self.pipeline = rs.pipeline()
+            self.get_logger().info("Initializing RealSense pipeline for camera_info...")
+            self.pipeline.start(config)
+            
+            # Cache color stream intrinsics for CameraInfo
+            profile = self.pipeline.get_active_profile()
+            color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
+            self._color_intrinsics = color_profile.get_intrinsics()
+            self.get_logger().info(
+                "RealSense color intrinsics: fx=%.1f fy=%.1f cx=%.1f cy=%.1f"
+                % (
+                    self._color_intrinsics.fx,
+                    self._color_intrinsics.fy,
+                    self._color_intrinsics.ppx,
+                    self._color_intrinsics.ppy,
+                )
             )
-        )
+        except Exception as e:
+            self.get_logger().warn(f"Could not initialize RealSense for camera_info: {e}")
+            # Use default intrinsics if RealSense not available
+            self._color_intrinsics = type('obj', (object,), {
+                'fx': 525.0, 'fy': 525.0, 'ppx': 320.0, 'ppy': 240.0,
+                'coeffs': [0.0, 0.0, 0.0, 0.0, 0.0]
+            })()
+        
+        # Detect which source to use
+        self._detect_source()
 
         # Use /clock for message stamps (e.g. simulation, bag playback); require fresh messages
         self._clock_stamp = None
@@ -135,13 +160,127 @@ class WallSegmentationNode(Node):
         self._fps_last_count = 0
         self._clock_error_last_log = 0.0
         self._last_publish_time = 0.0
-        self._thread = threading.Thread(target=self._camera_loop, daemon=True)
-        self._thread.start()
+        
+        # Start camera loop only after source is detected
+        if self.source_type:
+            self._thread = threading.Thread(target=self._camera_loop, daemon=True)
+            self._thread.start()
+        else:
+            self.get_logger().error("No source detected, cannot start camera loop")
 
     def _clock_callback(self, msg):
         with self._clock_lock:
             self._clock_stamp = msg.clock
             self._clock_recv_time = time.monotonic()
+
+    def _sim_rgb_callback(self, msg):
+        """Callback for /rgb_sim subscription."""
+        try:
+            cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
+            # Put frame in queue (non-blocking, drop if queue full)
+            try:
+                self._sim_frame_queue.put_nowait(cv_image)
+            except queue.Full:
+                pass  # Drop frame if queue is full
+        except Exception as e:
+            self.get_logger().warn(f"Error processing sim frame: {e}")
+
+    def _detect_source(self):
+        """Simultaneously check for simulator feed (/rgb_sim) and RealSense camera.
+        Whichever is found first becomes the source."""
+        self.get_logger().info("Detecting video source (simulator or RealSense camera)...")
+        
+        sim_detected = threading.Event()
+        realsense_detected = threading.Event()
+        source_lock = threading.Lock()
+        detected_source = None
+        
+        # Create subscription for simulator detection
+        sim_msg_received = threading.Event()
+        
+        def sim_callback(msg):
+            sim_msg_received.set()
+        
+        temp_sim_sub = self.create_subscription(ImageMsg, "/rgb_sim", sim_callback, 10)
+        
+        def check_realsense():
+            """Check for RealSense camera."""
+            if self.pipeline is None:
+                return
+            
+            start_time = time.monotonic()
+            while time.monotonic() - start_time < SOURCE_DETECTION_TIMEOUT_SEC:
+                if sim_detected.is_set() or realsense_detected.is_set():
+                    break
+                try:
+                    frames = self.pipeline.wait_for_frames(timeout_ms=100)
+                    color_frame = frames.get_color_frame()
+                    if color_frame:
+                        with source_lock:
+                            if detected_source is None:
+                                detected_source = "realsense"
+                                realsense_detected.set()
+                                self.get_logger().info("RealSense camera source detected")
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.1)
+        
+        # Start RealSense check in separate thread
+        realsense_thread = threading.Thread(target=check_realsense, daemon=True)
+        realsense_thread.start()
+        
+        # Check for simulator feed in main thread (so executor can process callbacks)
+        # Use executor to process callbacks
+        executor = SingleThreadedExecutor()
+        executor.add_node(self)
+        
+        start_time = time.monotonic()
+        while time.monotonic() - start_time < SOURCE_DETECTION_TIMEOUT_SEC:
+            # Process callbacks to receive simulator messages
+            executor.spin_once(timeout_sec=0.1)
+            
+            if sim_msg_received.is_set():
+                with source_lock:
+                    if detected_source is None:
+                        detected_source = "simulator"
+                        sim_detected.set()
+                        self.get_logger().info("Simulator source detected")
+                break
+            
+            if realsense_detected.is_set():
+                break
+        
+        # Clean up
+        executor.remove_node(self)
+        self.destroy_subscription(temp_sim_sub)
+        
+        # Wait for RealSense thread to finish
+        realsense_thread.join(timeout=0.5)
+        
+        with source_lock:
+            if detected_source is None:
+                self.get_logger().error(
+                    f"No video source found after {SOURCE_DETECTION_TIMEOUT_SEC} seconds. "
+                    "Retrying..."
+                )
+                # Retry detection
+                time.sleep(1.0)
+                self._detect_source()
+                return
+            else:
+                self.source_type = detected_source
+        
+        # Set up source-specific resources
+        if self.source_type == "simulator":
+            # Create subscription for simulator feed
+            self._sim_sub = self.create_subscription(
+                ImageMsg, "/rgb_sim", self._sim_rgb_callback, 10
+            )
+            self.get_logger().info("Subscribed to /rgb_sim for simulator feed")
+        elif self.source_type == "realsense":
+            # Pipeline already initialized, ready to use
+            self.get_logger().info("Using RealSense camera pipeline")
 
     def _get_stamp(self):
         """Stamp from /clock only. Returns None if /clock not received or stale (e.g. bag stopped)."""
@@ -153,18 +292,40 @@ class WallSegmentationNode(Node):
             return self._clock_stamp
 
     def _camera_loop(self):
-        """Tight loop like run_realsense_live.py: no timer/executor overhead."""
+        """Tight loop: process frames from either simulator or RealSense source."""
         while not self._stop:
-            try:
-                frames = self.pipeline.wait_for_frames(timeout_ms=500)
-            except Exception:
+            frame_rgb = None
+            
+            if self.source_type == "simulator":
+                # Get frame from simulator queue
+                try:
+                    frame_rgb = self._sim_frame_queue.get(timeout=0.5)
+                    # Resize simulator frame to match RealSense dimensions if needed
+                    if frame_rgb.shape[1] != RS_WIDTH or frame_rgb.shape[0] != RS_HEIGHT:
+                        frame_rgb = cv2.resize(frame_rgb, (RS_WIDTH, RS_HEIGHT), interpolation=cv2.INTER_LINEAR)
+                except queue.Empty:
+                    continue
+            elif self.source_type == "realsense":
+                # Get frame from RealSense pipeline
+                if self.pipeline is None:
+                    time.sleep(0.1)
+                    continue
+                try:
+                    frames = self.pipeline.wait_for_frames(timeout_ms=500)
+                except Exception:
+                    continue
+                color_frame = frames.get_color_frame()
+                if not color_frame:
+                    continue
+                frame_bgr = np.asanyarray(color_frame.get_data())
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            else:
+                # Unknown source type, wait and retry
+                time.sleep(0.1)
                 continue
-            color_frame = frames.get_color_frame()
-            if not color_frame:
+            
+            if frame_rgb is None:
                 continue
-
-            frame_bgr = np.asanyarray(color_frame.get_data())
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
             self.frame_count += 1
             if self.last_pred is None or (self.frame_count % self.args.process_every == 0):
@@ -252,11 +413,12 @@ class WallSegmentationNode(Node):
                 self._fps_last_count = self.frame_count
 
     def shutdown(self):
-        self.get_logger().info("Stopping RealSense pipeline...")
+        self.get_logger().info("Stopping...")
         self._stop = True
-        if self._thread.is_alive():
+        if hasattr(self, '_thread') and self._thread.is_alive():
             self._thread.join(timeout=2.0)
-        self.pipeline.stop()
+        if self.pipeline is not None:
+            self.pipeline.stop()
 
 
 def main():

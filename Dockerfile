@@ -11,7 +11,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Python deps for wall segmentation (no CUDA in base image; host nvidia runtime will provide GPU)
+# Pin numpy<2 to be compatible with ROS cv_bridge (compiled against numpy 1.x)
 RUN pip3 install --no-cache-dir \
+    "numpy<2" \
     torch \
     torchvision \
     opencv-python \
