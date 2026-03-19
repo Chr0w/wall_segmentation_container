@@ -30,11 +30,11 @@ from utils.constants import DEVICE
 from utils.utils import get_wall_mask_overlay
 
 
-RS_WIDTH = 640
-RS_HEIGHT = 480
+RS_WIDTH = 1280
+RS_HEIGHT = 720
 RS_FPS = 30
 PROCESS_EVERY_N = 1
-FRAME_ID = "camera_optical_frame"
+FRAME_ID = "Camera_OmniVision_OV9782_Color"
 # Default parent frame for TF (must exist in your TF tree; override with --tf-parent)
 TF_PARENT_FRAME_DEFAULT = "base_link"
 # If no /clock message received for this long, treat clock as unavailable and stop publishing
@@ -58,6 +58,7 @@ class WallSegmentationNode(Node):
         self.bridge = CvBridge()
         self.pub_rgb = self.create_publisher(ImageMsg, "/rgb", 10)
         self.pub_rgb_wall_mask = self.create_publisher(ImageMsg, "/rgb_wall_mask", 10)
+        self.pub_rgb_and_mask = self.create_publisher(ImageMsg, "/rgb_and_mask", 10)
         self.pub_camera_info = self.create_publisher(CameraInfo, "/camera_info", 10)
 
         try:
@@ -76,13 +77,19 @@ class WallSegmentationNode(Node):
         t.child_frame_id = FRAME_ID
         t.transform.translation.x = 0.0
         t.transform.translation.y = 0.0
-        t.transform.translation.z = 3.0
+        t.transform.translation.z = 0.4
+        # t.transform.translation.z = 3.0
 
         # RPY (deg) -> quaternion for TF (ROS order: Rz(yaw)*Ry(pitch)*Rx(roll))
         # Rotation is around parent frame (base_link)
+        # roll = 0.0
+        # pitch = 0.0
+        # yaw = 0.0
+
         roll = -90.0
         pitch = 0.0
         yaw = -90.0
+
         roll_rad = math.radians(roll)
         pitch_rad = math.radians(pitch)
         yaw_rad = math.radians(yaw)
@@ -134,8 +141,14 @@ class WallSegmentationNode(Node):
         except Exception as e:
             self.get_logger().warn(f"Could not initialize RealSense for camera_info: {e}")
             # Use default intrinsics if RealSense not available
+            # Scale default intrinsics to match RS_WIDTH x RS_HEIGHT
+            # Default assumes 640x480, so scale by actual resolution
+            default_fx = 525.0 * (RS_WIDTH / 640.0)
+            default_fy = 525.0 * (RS_HEIGHT / 480.0)
+            default_cx = RS_WIDTH / 2.0
+            default_cy = RS_HEIGHT / 2.0
             self._color_intrinsics = type('obj', (object,), {
-                'fx': 525.0, 'fy': 525.0, 'ppx': 320.0, 'ppy': 240.0,
+                'fx': default_fx, 'fy': default_fy, 'ppx': default_cx, 'ppy': default_cy,
                 'coeffs': [0.0, 0.0, 0.0, 0.0, 0.0]
             })()
         
@@ -367,6 +380,16 @@ class WallSegmentationNode(Node):
             frame_pub = cv2.resize(frame_rgb, (pub_w, pub_h), interpolation=cv2.INTER_LINEAR)
             mask_pub = cv2.resize(mask_view, (pub_w, pub_h), interpolation=cv2.INTER_NEAREST)
 
+            self.get_logger().error(f"width: {pub_w}, height: {pub_h}")
+            
+            # Create mask overlay for blending (green for walls)
+            pred_resized = cv2.resize(pred_for_display, (pub_w, pub_h), interpolation=cv2.INTER_NEAREST)
+            mask_overlay = np.zeros_like(frame_pub)
+            mask_overlay[pred_resized == 0] = [0, 255, 0]  # Green for walls (class 0)
+            
+            # Blend original image with mask overlay at alpha 0.5
+            rgb_and_mask = cv2.addWeighted(frame_pub, 0.5, mask_overlay, 0.5, 0)
+
             # RViz2 Camera display requires CameraInfo on /camera_info (same stamp/frame_id as image)
             # Scale intrinsics to match downscaled image size
             scale_x = pub_w / RS_WIDTH
@@ -401,6 +424,13 @@ class WallSegmentationNode(Node):
             msg_mask.header.stamp = stamp
             msg_mask.header.frame_id = FRAME_ID
             self.pub_rgb_wall_mask.publish(msg_mask)
+
+            msg_rgb_and_mask = self.bridge.cv2_to_imgmsg(
+                np.ascontiguousarray(rgb_and_mask), encoding="rgb8"
+            )
+            msg_rgb_and_mask.header.stamp = stamp
+            msg_rgb_and_mask.header.frame_id = FRAME_ID
+            self.pub_rgb_and_mask.publish(msg_rgb_and_mask)
 
             # Print framerate every 5 seconds
             now = time.monotonic()
@@ -449,7 +479,7 @@ def main():
         "--tf-parent",
         default=TF_PARENT_FRAME_DEFAULT,
         dest="tf_parent_frame",
-        help="Parent frame for camera_optical_frame in TF (must exist in tree; default: map)",
+        help="Parent frame for Camera_OmniVision_OV9782_Color in TF (must exist in tree; default: map)",
     )
     args = parser.parse_args()
 
