@@ -7,6 +7,7 @@ the feed as a textured quad in the 3D view, use the rviz_textured_quads plugin:
 Subscribe its "Image" topic to /rgb or /rgb_wall_mask.
 """
 import argparse
+import json
 import math
 import threading
 import time
@@ -40,16 +41,15 @@ TF_PARENT_FRAME_DEFAULT = "base_link"
 # If no /clock message received for this long, treat clock as unavailable and stop publishing
 CLOCK_TIMEOUT_SEC = 1.0
 
-# Downscale percentage for published images (0.1 = 10% of width/height)
-DOWNSCALE_PERCENTAGE = 1.0
 # Max publish rate (Hz); skip publishing if last publish was sooner
-PUBLISH_MAX_HZ = 10.0
+PUBLISH_MAX_HZ = 20.0
 
 # Test variable to set all walls to true
 ALL_TRUE = False
 
 # Source detection timeout
 SOURCE_DETECTION_TIMEOUT_SEC = 10.0
+CAMERA_INFO_PATH = "configs/camera_info.json"
 
 class WallSegmentationNode(Node):
     def __init__(self, args):
@@ -66,6 +66,7 @@ class WallSegmentationNode(Node):
         except ImportError:
             self.get_logger().error("pyrealsense2 not installed")
             raise
+        self._rs = rs
 
         # Publish static TF so RViz2 Camera display can place the image (frame_id must be in TF tree)
         # Camera is rotated so it looks forward.
@@ -112,45 +113,20 @@ class WallSegmentationNode(Node):
         # Detect source (simulator or RealSense camera)
         self.source_type = None  # "simulator" or "realsense"
         self.pipeline = None
-        self._color_intrinsics = None
+        self._camera_cfg = self._load_camera_config(CAMERA_INFO_PATH)
         self._sim_frame_queue = queue.Queue(maxsize=10)
         self._sim_sub = None
-        
-        # Always initialize RealSense pipeline to get camera_info intrinsics
-        # (needed for both sources)
-        try:
-            config = rs.config()
-            config.enable_stream(rs.stream.color, RS_WIDTH, RS_HEIGHT, rs.format.bgr8, RS_FPS)
-            self.pipeline = rs.pipeline()
-            self.get_logger().info("Initializing RealSense pipeline for camera_info...")
-            self.pipeline.start(config)
-            
-            # Cache color stream intrinsics for CameraInfo
-            profile = self.pipeline.get_active_profile()
-            color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
-            self._color_intrinsics = color_profile.get_intrinsics()
-            self.get_logger().info(
-                "RealSense color intrinsics: fx=%.1f fy=%.1f cx=%.1f cy=%.1f"
-                % (
-                    self._color_intrinsics.fx,
-                    self._color_intrinsics.fy,
-                    self._color_intrinsics.ppx,
-                    self._color_intrinsics.ppy,
-                )
+        self.get_logger().info(
+            "Loaded camera config: %dx%d fx=%.2f fy=%.2f cx=%.2f cy=%.2f"
+            % (
+                self._camera_cfg["width"],
+                self._camera_cfg["height"],
+                self._camera_cfg["fx"],
+                self._camera_cfg["fy"],
+                self._camera_cfg["cx"],
+                self._camera_cfg["cy"],
             )
-        except Exception as e:
-            self.get_logger().warn(f"Could not initialize RealSense for camera_info: {e}")
-            # Use default intrinsics if RealSense not available
-            # Scale default intrinsics to match RS_WIDTH x RS_HEIGHT
-            # Default assumes 640x480, so scale by actual resolution
-            default_fx = 525.0 * (RS_WIDTH / 640.0)
-            default_fy = 525.0 * (RS_HEIGHT / 480.0)
-            default_cx = RS_WIDTH / 2.0
-            default_cy = RS_HEIGHT / 2.0
-            self._color_intrinsics = type('obj', (object,), {
-                'fx': default_fx, 'fy': default_fy, 'ppx': default_cx, 'ppy': default_cy,
-                'coeffs': [0.0, 0.0, 0.0, 0.0, 0.0]
-            })()
+        )
         
         # Detect which source to use
         self._detect_source()
@@ -186,6 +162,19 @@ class WallSegmentationNode(Node):
             self._clock_stamp = msg.clock
             self._clock_recv_time = time.monotonic()
 
+    def _load_camera_config(self, path):
+        """Load shared camera intrinsics from JSON config. Raises on missing/invalid fields."""
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        required = ["width", "height", "fx", "fy", "cx", "cy", "distortion_model", "d"]
+        missing = [k for k in required if k not in data]
+        if missing:
+            raise ValueError(f"camera config missing fields: {missing}")
+        if not isinstance(data["d"], list) or len(data["d"]) < 5:
+            raise ValueError("camera config field 'd' must be a list with at least 5 values")
+        return data
+
     def _sim_rgb_callback(self, msg):
         """Callback for /rgb_sim subscription."""
         try:
@@ -210,6 +199,7 @@ class WallSegmentationNode(Node):
         
         # Create subscription for simulator detection
         sim_msg_received = threading.Event()
+        detected_pipeline = {"pipeline": None}
         
         def sim_callback(msg):
             sim_msg_received.set()
@@ -218,26 +208,39 @@ class WallSegmentationNode(Node):
         
         def check_realsense():
             """Check for RealSense camera."""
-            if self.pipeline is None:
-                return
-            
+            rs = self._rs
             start_time = time.monotonic()
+            local_pipeline = None
             while time.monotonic() - start_time < SOURCE_DETECTION_TIMEOUT_SEC:
                 if sim_detected.is_set() or realsense_detected.is_set():
                     break
                 try:
-                    frames = self.pipeline.wait_for_frames(timeout_ms=100)
+                    if local_pipeline is None:
+                        config = rs.config()
+                        config.enable_stream(
+                            rs.stream.color, RS_WIDTH, RS_HEIGHT, rs.format.bgr8, RS_FPS
+                        )
+                        local_pipeline = rs.pipeline()
+                        local_pipeline.start(config)
+                    frames = local_pipeline.wait_for_frames(timeout_ms=100)
                     color_frame = frames.get_color_frame()
                     if color_frame:
                         with source_lock:
                             if detected_source is None:
                                 detected_source = "realsense"
+                                detected_pipeline["pipeline"] = local_pipeline
                                 realsense_detected.set()
                                 self.get_logger().info("RealSense camera source detected")
+                                local_pipeline = None  # ownership transferred
                         break
                 except Exception:
                     pass
                 time.sleep(0.1)
+            if local_pipeline is not None:
+                try:
+                    local_pipeline.stop()
+                except Exception:
+                    pass
         
         # Start RealSense check in separate thread
         realsense_thread = threading.Thread(target=check_realsense, daemon=True)
@@ -292,7 +295,7 @@ class WallSegmentationNode(Node):
             )
             self.get_logger().info("Subscribed to /rgb_sim for simulator feed")
         elif self.source_type == "realsense":
-            # Pipeline already initialized, ready to use
+            self.pipeline = detected_pipeline["pipeline"]
             self.get_logger().info("Using RealSense camera pipeline")
 
     def _get_stamp(self):
@@ -373,39 +376,31 @@ class WallSegmentationNode(Node):
                 continue
             self._last_publish_time = now
 
-            # Downscale for publish (reduces bandwidth and CPU)
-            scale = DOWNSCALE_PERCENTAGE
-            pub_w = max(1, int(RS_WIDTH * scale))
-            pub_h = max(1, int(RS_HEIGHT * scale))
-            frame_pub = cv2.resize(frame_rgb, (pub_w, pub_h), interpolation=cv2.INTER_LINEAR)
-            mask_pub = cv2.resize(mask_view, (pub_w, pub_h), interpolation=cv2.INTER_NEAREST)
-
-            self.get_logger().error(f"width: {pub_w}, height: {pub_h}")
+            # Publish at native frame size (no scaling)
+            pub_h, pub_w = frame_rgb.shape[:2]
+            frame_pub = frame_rgb
+            mask_pub = mask_view
             
             # Create mask overlay for blending (green for walls)
-            pred_resized = cv2.resize(pred_for_display, (pub_w, pub_h), interpolation=cv2.INTER_NEAREST)
             mask_overlay = np.zeros_like(frame_pub)
-            mask_overlay[pred_resized == 0] = [0, 255, 0]  # Green for walls (class 0)
+            mask_overlay[pred_for_display == 0] = [0, 255, 0]  # Green for walls (class 0)
             
             # Blend original image with mask overlay at alpha 0.5
             rgb_and_mask = cv2.addWeighted(frame_pub, 0.5, mask_overlay, 0.5, 0)
 
             # RViz2 Camera display requires CameraInfo on /camera_info (same stamp/frame_id as image)
-            # Scale intrinsics to match downscaled image size
-            scale_x = pub_w / RS_WIDTH
-            scale_y = pub_h / RS_HEIGHT
-            intr = self._color_intrinsics
-            fx = intr.fx * scale_x
-            fy = intr.fy * scale_y
-            cx = intr.ppx * scale_x
-            cy = intr.ppy * scale_y
+            cam = self._camera_cfg
+            fx = cam["fx"]
+            fy = cam["fy"]
+            cx = cam["cx"]
+            cy = cam["cy"]
             info = CameraInfo()
             info.header.stamp = stamp
             info.header.frame_id = FRAME_ID
-            info.height = pub_h
-            info.width = pub_w
-            info.distortion_model = "plumb_bob"
-            info.d = list(intr.coeffs) if len(intr.coeffs) >= 5 else [0.0, 0.0, 0.0, 0.0, 0.0]
+            info.height = int(cam["height"])
+            info.width = int(cam["width"])
+            info.distortion_model = cam["distortion_model"]
+            info.d = list(cam["d"])
             info.k = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
             info.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
             info.p = [fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
